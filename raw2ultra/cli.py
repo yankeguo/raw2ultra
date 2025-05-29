@@ -207,12 +207,12 @@ def create_ultra_hdr_jpeg(
             sdr_segments.append((marker, segment_data))
             pos += length
 
-    # Add essential JPEG segments first
-    for marker, data in sdr_segments:
-        if marker in [0xE0]:  # JFIF first
-            result.extend(b"\xff" + bytes([marker]))
-            result.extend(data)
-            break
+    # Add essential JPEG segments first - skip JFIF since good.jpg doesn't have it
+    # for marker, data in sdr_segments:
+    #     if marker in [0xE0]:  # JFIF first
+    #         result.extend(b"\xff" + bytes([marker]))
+    #         result.extend(data)
+    #         break
 
     # Calculate gain map size first
     gain_map_size = len(gain_map_data)
@@ -237,21 +237,27 @@ def create_ultra_hdr_jpeg(
     # MPF uses APP2 marker (0xFFE2)
     mpf_signature = b"MPF\x00"
 
-    # Calculate offset for gain map (will be at the end of the main image)
-    # gain_map_size already calculated above
+    # Calculate the offset for the gain map
+    # The gain map should start right after the main image ends (at the EOI marker)
+    # We need to calculate the size of everything up to but not including the gain map
+    main_image_end_offset = len(result) + 2  # +2 for the EOI marker we'll add
+    gain_map_offset = main_image_end_offset
 
     # Create proper TIFF IFD structure for MPF
     # TIFF header: byte order + magic number + IFD offset
     tiff_header = b"MM\x00\x2a\x00\x00\x00\x08"  # Big-endian TIFF, IFD at offset 8
 
     # Create MPF Image entries (16 bytes each)
-    # First image entry (main image)
+    # First image entry (main image) - should match good.jpg format
+    # Calculate the main image size (from SOI to EOI, excluding gain map)
+    main_image_size = len(sdr_image_data)
+
     image_entry_1 = struct.pack(
-        ">I", 0x020002
-    )  # Image type: representative image, JPEG
-    image_entry_1 += struct.pack(">I", 0)  # Size (0 for first image)
+        ">I", 0x030000
+    )  # Image type: 0x030000 (matches good.jpg format)
+    image_entry_1 += struct.pack(">I", main_image_size)  # Size of main image (not 0)
     image_entry_1 += struct.pack(">I", 0)  # Offset (0 for first image)
-    image_entry_1 += struct.pack(">H", 1)  # Dependent images count
+    image_entry_1 += struct.pack(">H", 0)  # Dependent images count (0, not 1)
     image_entry_1 += struct.pack(">H", 0)  # Reserved
 
     # Second image entry (gain map) - offset will be updated later
@@ -335,7 +341,10 @@ def create_ultra_hdr_jpeg(
         pos += 1
 
     # Calculate the offset for the gain map
-    gain_map_offset = len(result) + 2  # +2 for the EOI marker we'll add
+    # The gain map should start right after the main image ends (at the EOI marker)
+    # We need to calculate the size of everything up to but not including the gain map
+    main_image_end_offset = len(result) + 2  # +2 for the EOI marker we'll add
+    gain_map_offset = main_image_end_offset
 
     # Update the MPF directory with the correct offset
     # Find the MPF segment and update the offset
@@ -347,7 +356,7 @@ def create_ultra_hdr_jpeg(
             mpf_start + 4 + 8 + 2 + 36 + 4 + 16 + 8
         )  # Position of offset field in second MP Entry
         if offset_pos + 4 <= len(result):
-            # Update the offset
+            # Update the offset to point to where the gain map actually starts
             struct.pack_into(">I", result, offset_pos, gain_map_offset)
 
     # Add EOI marker for main image
