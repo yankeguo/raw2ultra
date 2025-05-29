@@ -130,22 +130,36 @@ def create_ultra_hdr_jpeg(
     """
     click.echo("Creating UltraHDR JPEG with embedded gain map...")
 
-    # UltraHDR XMP metadata template
-    xmp_template = """<?xml version="1.0" encoding="UTF-8"?>
-<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Adobe XMP Core 6.0-c002 79.164488, 2020/07/10-22:06:53        ">
- <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
-  <rdf:Description rdf:about=""
-    xmlns:hdrgm="http://ns.adobe.com/hdr-gain-map/1.0/"
-    hdrgm:Version="1.0"
-    hdrgm:GainMapMin="0"
-    hdrgm:GainMapMax="4.0"
-    hdrgm:Gamma="1.0"
-    hdrgm:OffsetSDR="0.015625"
-    hdrgm:OffsetHDR="0.015625"
-    hdrgm:HDRCapacityMin="0"
-    hdrgm:HDRCapacityMax="4.0"
-    hdrgm:BaseRenditionIsHDR="False"/>
- </rdf:RDF>
+    # Google UltraHDR XMP metadata template (Container format)
+    xmp_template = """<x:xmpmeta
+  xmlns:x="adobe:ns:meta/"
+  x:xmptk="Adobe XMP Core 5.1.2">
+  <rdf:RDF
+    xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description
+      xmlns:Container="http://ns.google.com/photos/1.0/container/"
+      xmlns:Item="http://ns.google.com/photos/1.0/container/item/"
+      xmlns:hdrgm="http://ns.adobe.com/hdr-gain-map/1.0/"
+      hdrgm:Version="1.0">
+      <Container:Directory>
+        <rdf:Seq>
+          <rdf:li
+            rdf:parseType="Resource">
+            <Container:Item
+              Item:Semantic="Primary"
+              Item:Mime="image/jpeg"/>
+          </rdf:li>
+          <rdf:li
+            rdf:parseType="Resource">
+            <Container:Item
+              Item:Semantic="GainMap"
+              Item:Mime="image/jpeg"
+              Item:Length="{gain_map_size}"/>
+          </rdf:li>
+        </rdf:Seq>
+      </Container:Directory>
+    </rdf:Description>
+  </rdf:RDF>
 </x:xmpmeta>"""
 
     # Build the final JPEG
@@ -200,6 +214,9 @@ def create_ultra_hdr_jpeg(
             result.extend(data)
             break
 
+    # Calculate gain map size first
+    gain_map_size = len(gain_map_data)
+
     # Add EXIF data if provided
     if exif_data:
         exif_segment = struct.pack(">H", len(exif_data) + 2) + exif_data
@@ -208,7 +225,7 @@ def create_ultra_hdr_jpeg(
         click.echo("Added EXIF data to output JPEG")
 
     # Add XMP metadata with gain map info
-    xmp_data = xmp_template.encode("utf-8")
+    xmp_data = xmp_template.format(gain_map_size=gain_map_size).encode("utf-8")
     xmp_header = b"http://ns.adobe.com/xap/1.0/\x00"
     xmp_segment = (
         struct.pack(">H", len(xmp_header) + len(xmp_data) + 2) + xmp_header + xmp_data
@@ -221,7 +238,7 @@ def create_ultra_hdr_jpeg(
     mpf_signature = b"MPF\x00"
 
     # Calculate offset for gain map (will be at the end of the main image)
-    gain_map_size = len(gain_map_data)
+    # gain_map_size already calculated above
 
     # Create proper TIFF IFD structure for MPF
     # TIFF header: byte order + magic number + IFD offset
