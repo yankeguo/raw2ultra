@@ -67,7 +67,7 @@ def tone_map_to_sdr(hdr_linear_data: np.ndarray) -> np.ndarray:
 
 def calculate_gain_map(
     hdr_linear_data: np.ndarray, sdr_srgb_data: np.ndarray
-) -> np.ndarray:
+) -> tuple[np.ndarray, dict]:
     """Calculate gain map from HDR and SDR data.
 
     Args:
@@ -75,7 +75,9 @@ def calculate_gain_map(
         sdr_srgb_data: sRGB SDR data with shape (h, w, 3)
 
     Returns:
-        Gain map data with shape (h, w, 3) representing HDR/SDR ratio
+        Tuple of (gain_map_data, gain_map_params) where:
+        - gain_map_data: Gain map data with shape (h, w, 3) representing HDR/SDR ratio
+        - gain_map_params: Dictionary with gain map parameters for XMP metadata
     """
     click.echo("Calculating gain map...")
 
@@ -86,27 +88,59 @@ def calculate_gain_map(
         np.power((sdr_srgb_data + 0.055) / 1.055, 2.4),
     )
 
+    # Use proper offsets as per UltraHDR spec
+    offset_sdr = 0.015625  # 1/64
+    offset_hdr = 0.015625  # 1/64
+
     # Calculate gain = HDR / SDR (with safety for division by zero)
     sdr_linear_safe = np.maximum(sdr_linear, 1e-8)
-    gain_linear = hdr_linear_data / sdr_linear_safe
+    gain_linear = (hdr_linear_data + offset_hdr) / (sdr_linear_safe + offset_sdr)
 
-    # Clamp gain to reasonable range (e.g., 1/16 to 16x)
-    gain_linear = np.clip(gain_linear, 1.0 / 16.0, 16.0)
+    # Determine actual min and max content boost from the data
+    min_content_boost = float(
+        np.percentile(gain_linear, 1)
+    )  # 1st percentile to avoid outliers
+    max_content_boost = float(
+        np.percentile(gain_linear, 99)
+    )  # 99th percentile to avoid outliers
 
-    # Convert gain to logarithmic space for better representation
-    # Using log2 so that 1x gain = 0, 2x gain = 1, 4x gain = 2, etc.
-    gain_log = np.log2(gain_linear)
+    # Ensure reasonable bounds
+    min_content_boost = max(min_content_boost, 0.25)  # At least 1/4x
+    max_content_boost = max(max_content_boost, 1.0)  # At least 1x
 
-    # Normalize to 0-1 range for JPEG encoding
-    # Assuming gain range of 1/16x to 16x gives log2 range of -4 to 4
-    gain_normalized = (gain_log + 4.0) / 8.0
-    gain_normalized = np.clip(gain_normalized, 0.0, 1.0)
+    # Clamp gain to computed range
+    gain_linear = np.clip(gain_linear, min_content_boost, max_content_boost)
+
+    # Convert gain to logarithmic space for encoding
+    map_min_log2 = np.log2(min_content_boost)
+    map_max_log2 = np.log2(max_content_boost)
+    map_gamma = 1.0
+
+    # Encode gain map
+    log_recovery = (np.log2(gain_linear) - map_min_log2) / (map_max_log2 - map_min_log2)
+    clamped_recovery = np.clip(log_recovery, 0.0, 1.0)
+    gain_normalized = np.power(clamped_recovery, map_gamma)
+
+    # Prepare parameters for XMP metadata
+    gain_map_params = {
+        "gain_map_min": map_min_log2,
+        "gain_map_max": map_max_log2,
+        "gamma": map_gamma,
+        "offset_sdr": offset_sdr,
+        "offset_hdr": offset_hdr,
+        "hdr_capacity_min": max(map_min_log2, 0.0),  # Per UltraHDR spec
+        "hdr_capacity_max": map_max_log2,
+    }
 
     click.echo(
         f"Gain map range: min={gain_normalized.min():.6f}, max={gain_normalized.max():.6f}, mean={gain_normalized.mean():.6f}"
     )
+    click.echo(
+        f"Content boost: min={min_content_boost:.6f}x, max={max_content_boost:.6f}x"
+    )
+    click.echo(f"Log2 range: min={map_min_log2:.6f}, max={map_max_log2:.6f}")
 
-    return gain_normalized
+    return gain_normalized, gain_map_params
 
 
 def create_ultra_hdr_jpeg(
@@ -114,6 +148,7 @@ def create_ultra_hdr_jpeg(
     gain_map_data: bytes,
     width: int,
     height: int,
+    gain_map_params: dict,
     exif_data: bytes = b"",
 ) -> bytes:
     """Create UltraHDR JPEG with embedded gain map using MPF (Multi-Picture Format).
@@ -123,6 +158,7 @@ def create_ultra_hdr_jpeg(
         gain_map_data: JPEG bytes of the gain map
         width: Image width
         height: Image height
+        gain_map_params: Dictionary with gain map parameters for XMP metadata
         exif_data: Optional EXIF data to include
 
     Returns:
@@ -130,7 +166,7 @@ def create_ultra_hdr_jpeg(
     """
     click.echo("Creating UltraHDR JPEG with embedded gain map...")
 
-    # Google UltraHDR XMP metadata template (Container format)
+    # Google UltraHDR XMP metadata template (Container format + HDR gain map metadata)
     xmp_template = """<x:xmpmeta
   xmlns:x="adobe:ns:meta/"
   x:xmptk="Adobe XMP Core 5.1.2">
@@ -140,7 +176,15 @@ def create_ultra_hdr_jpeg(
       xmlns:Container="http://ns.google.com/photos/1.0/container/"
       xmlns:Item="http://ns.google.com/photos/1.0/container/item/"
       xmlns:hdrgm="http://ns.adobe.com/hdr-gain-map/1.0/"
-      hdrgm:Version="1.0">
+      hdrgm:Version="1.0"
+      hdrgm:BaseRenditionIsHDR="False"
+      hdrgm:GainMapMin="{gain_map_min}"
+      hdrgm:GainMapMax="{gain_map_max}"
+      hdrgm:Gamma="{gamma}"
+      hdrgm:OffsetSDR="{offset_sdr}"
+      hdrgm:OffsetHDR="{offset_hdr}"
+      hdrgm:HDRCapacityMin="{hdr_capacity_min}"
+      hdrgm:HDRCapacityMax="{hdr_capacity_max}">
       <Container:Directory>
         <rdf:Seq>
           <rdf:li
@@ -225,7 +269,16 @@ def create_ultra_hdr_jpeg(
         click.echo("Added EXIF data to output JPEG")
 
     # Add XMP metadata with gain map info
-    xmp_data = xmp_template.format(gain_map_size=gain_map_size).encode("utf-8")
+    xmp_data = xmp_template.format(
+        gain_map_size=gain_map_size,
+        gain_map_min=gain_map_params["gain_map_min"],
+        gain_map_max=gain_map_params["gain_map_max"],
+        gamma=gain_map_params["gamma"],
+        offset_sdr=gain_map_params["offset_sdr"],
+        offset_hdr=gain_map_params["offset_hdr"],
+        hdr_capacity_min=gain_map_params["hdr_capacity_min"],
+        hdr_capacity_max=gain_map_params["hdr_capacity_max"],
+    ).encode("utf-8")
     xmp_header = b"http://ns.adobe.com/xap/1.0/\x00"
     xmp_segment = (
         struct.pack(">H", len(xmp_header) + len(xmp_data) + 2) + xmp_header + xmp_data
@@ -245,7 +298,7 @@ def create_ultra_hdr_jpeg(
 
     # Create proper TIFF IFD structure for MPF
     # TIFF header: byte order + magic number + IFD offset
-    tiff_header = b"MM\x00\x2a\x00\x00\x00\x08"  # Big-endian TIFF, IFD at offset 8
+    tiff_header = b"II\x2a\x00\x08\x00\x00\x00"  # Little-endian TIFF, IFD at offset 8
 
     # Create MPF Image entries (16 bytes each)
     # First image entry (main image) - should match good.jpg format
@@ -253,19 +306,19 @@ def create_ultra_hdr_jpeg(
     main_image_size = len(sdr_image_data)
 
     image_entry_1 = struct.pack(
-        ">I", 0x030000
+        "<I", 0x030000
     )  # Image type: 0x030000 (matches good.jpg format)
-    image_entry_1 += struct.pack(">I", main_image_size)  # Size of main image (not 0)
-    image_entry_1 += struct.pack(">I", 0)  # Offset (0 for first image)
-    image_entry_1 += struct.pack(">H", 0)  # Dependent images count (0, not 1)
-    image_entry_1 += struct.pack(">H", 0)  # Reserved
+    image_entry_1 += struct.pack("<I", main_image_size)  # Size of main image (not 0)
+    image_entry_1 += struct.pack("<I", 0)  # Offset (0 for first image)
+    image_entry_1 += struct.pack("<H", 0)  # Dependent images count (0, not 1)
+    image_entry_1 += struct.pack("<H", 0)  # Reserved
 
     # Second image entry (gain map) - offset will be updated later
-    image_entry_2 = struct.pack(">I", 0x000000)  # Image type: undefined
-    image_entry_2 += struct.pack(">I", gain_map_size)  # Size
-    image_entry_2 += struct.pack(">I", 0)  # Offset (placeholder, will be calculated)
-    image_entry_2 += struct.pack(">H", 0)  # Dependent images count
-    image_entry_2 += struct.pack(">H", 0)  # Reserved
+    image_entry_2 = struct.pack("<I", 0x000000)  # Image type: undefined
+    image_entry_2 += struct.pack("<I", gain_map_size)  # Size
+    image_entry_2 += struct.pack("<I", 0)  # Offset (placeholder, will be calculated)
+    image_entry_2 += struct.pack("<H", 0)  # Dependent images count
+    image_entry_2 += struct.pack("<H", 0)  # Reserved
 
     # Create MP Entry array
     mp_entry_data = image_entry_1 + image_entry_2
@@ -278,28 +331,28 @@ def create_ultra_hdr_jpeg(
     ifd_entries = bytearray()
 
     # MPF Version tag (0xB000)
-    ifd_entries.extend(struct.pack(">H", 0xB000))  # Tag
-    ifd_entries.extend(struct.pack(">H", 7))  # Type: UNDEFINED
-    ifd_entries.extend(struct.pack(">I", 4))  # Count
+    ifd_entries.extend(struct.pack("<H", 0xB000))  # Tag
+    ifd_entries.extend(struct.pack("<H", 7))  # Type: UNDEFINED
+    ifd_entries.extend(struct.pack("<I", 4))  # Count
     ifd_entries.extend(b"0100")  # Value: Version 1.0
 
     # Number of Images tag (0xB001)
-    ifd_entries.extend(struct.pack(">H", 0xB001))  # Tag
-    ifd_entries.extend(struct.pack(">H", 4))  # Type: LONG
-    ifd_entries.extend(struct.pack(">I", 1))  # Count
-    ifd_entries.extend(struct.pack(">I", 2))  # Value: 2 images
+    ifd_entries.extend(struct.pack("<H", 0xB001))  # Tag
+    ifd_entries.extend(struct.pack("<H", 4))  # Type: LONG
+    ifd_entries.extend(struct.pack("<I", 1))  # Count
+    ifd_entries.extend(struct.pack("<I", 2))  # Value: 2 images
 
     # MP Entry tag (0xB002) - points to the MP Entry data
-    ifd_entries.extend(struct.pack(">H", 0xB002))  # Tag
-    ifd_entries.extend(struct.pack(">H", 7))  # Type: UNDEFINED
-    ifd_entries.extend(struct.pack(">I", 32))  # Count: 32 bytes (2 entries × 16 bytes)
-    ifd_entries.extend(struct.pack(">I", mp_entry_offset))  # Offset to MP Entry data
+    ifd_entries.extend(struct.pack("<H", 0xB002))  # Tag
+    ifd_entries.extend(struct.pack("<H", 7))  # Type: UNDEFINED
+    ifd_entries.extend(struct.pack("<I", 32))  # Count: 32 bytes (2 entries × 16 bytes)
+    ifd_entries.extend(struct.pack("<I", mp_entry_offset))  # Offset to MP Entry data
 
     # Build complete TIFF IFD
     tiff_ifd = bytearray()
-    tiff_ifd.extend(struct.pack(">H", 3))  # Number of IFD entries
+    tiff_ifd.extend(struct.pack("<H", 3))  # Number of IFD entries
     tiff_ifd.extend(ifd_entries)  # IFD entries
-    tiff_ifd.extend(struct.pack(">I", 0))  # Offset to next IFD (0 = no next IFD)
+    tiff_ifd.extend(struct.pack("<I", 0))  # Offset to next IFD (0 = no next IFD)
     tiff_ifd.extend(mp_entry_data)  # MP Entry data
 
     # Complete MPF header
@@ -308,6 +361,13 @@ def create_ultra_hdr_jpeg(
 
     result.extend(b"\xff\xe2")  # APP2 marker for MPF
     result.extend(mpf_segment)
+
+    # Add JFIF and ICC segments from original if they exist
+    for marker, data in sdr_segments:
+        if marker in [0xE0, 0xE2]:  # JFIF and ICC profile
+            if marker == 0xE0 or (marker == 0xE2 and b"ICC_PROFILE" in data[:20]):
+                result.extend(b"\xff" + bytes([marker]))
+                result.extend(data)
 
     # Add other essential JPEG segments
     for marker, data in sdr_segments:
@@ -357,7 +417,7 @@ def create_ultra_hdr_jpeg(
         )  # Position of offset field in second MP Entry
         if offset_pos + 4 <= len(result):
             # Update the offset to point to where the gain map actually starts
-            struct.pack_into(">I", result, offset_pos, gain_map_offset)
+            struct.pack_into("<I", result, offset_pos, gain_map_offset)
 
     # Add EOI marker for main image
     result.extend(b"\xff\xd9")
@@ -445,9 +505,13 @@ def verify_ultra_hdr_jpeg(file_path: str) -> dict:
                 if (
                     len(mpf_data) >= 12
                 ):  # Minimum: TIFF header (8) + IFD count (2) + at least part of an entry
+                    # Detect endianness from TIFF header
+                    is_little_endian = mpf_data[:2] == b"II"
+                    endian_char = "<" if is_little_endian else ">"
+
                     # Skip TIFF header (8 bytes) and read IFD count
                     if len(mpf_data) >= 10:
-                        ifd_count = struct.unpack(">H", mpf_data[8:10])[0]
+                        ifd_count = struct.unpack(f"{endian_char}H", mpf_data[8:10])[0]
 
                         # Look for the NumberOfImages tag (0xB001)
                         ifd_start = 10
@@ -455,22 +519,23 @@ def verify_ultra_hdr_jpeg(file_path: str) -> dict:
                             entry_offset = ifd_start + (i * 12)
                             if entry_offset + 12 <= len(mpf_data):
                                 tag = struct.unpack(
-                                    ">H", mpf_data[entry_offset : entry_offset + 2]
+                                    f"{endian_char}H",
+                                    mpf_data[entry_offset : entry_offset + 2],
                                 )[0]
                                 if tag == 0xB001:  # NumberOfImages tag
                                     tag_type = struct.unpack(
-                                        ">H",
+                                        f"{endian_char}H",
                                         mpf_data[entry_offset + 2 : entry_offset + 4],
                                     )[0]
                                     tag_count = struct.unpack(
-                                        ">I",
+                                        f"{endian_char}I",
                                         mpf_data[entry_offset + 4 : entry_offset + 8],
                                     )[0]
                                     if (
                                         tag_type == 4 and tag_count == 1
                                     ):  # LONG type, single value
                                         num_images = struct.unpack(
-                                            ">I",
+                                            f"{endian_char}I",
                                             mpf_data[
                                                 entry_offset + 8 : entry_offset + 12
                                             ],
@@ -483,12 +548,13 @@ def verify_ultra_hdr_jpeg(file_path: str) -> dict:
                             entry_offset = ifd_start + (i * 12)
                             if entry_offset + 12 <= len(mpf_data):
                                 tag = struct.unpack(
-                                    ">H", mpf_data[entry_offset : entry_offset + 2]
+                                    f"{endian_char}H",
+                                    mpf_data[entry_offset : entry_offset + 2],
                                 )[0]
                                 if tag == 0xB002:  # MP Entry tag
                                     # Get offset to MP Entry data
                                     mp_entry_offset = struct.unpack(
-                                        ">I",
+                                        f"{endian_char}I",
                                         mpf_data[entry_offset + 8 : entry_offset + 12],
                                     )[0]
                                     # MP Entry data is relative to start of TIFF data (after MPF signature)
@@ -499,7 +565,7 @@ def verify_ultra_hdr_jpeg(file_path: str) -> dict:
                                         second_entry_start = mp_entry_offset + 16
                                         if second_entry_start + 8 <= len(mpf_data):
                                             gain_map_size = struct.unpack(
-                                                ">I",
+                                                f"{endian_char}I",
                                                 mpf_data[
                                                     second_entry_start
                                                     + 4 : second_entry_start
@@ -713,7 +779,7 @@ def cli(input_file, output, verify):
     sdr_srgb_data = tone_map_to_sdr(hdr_linear_data)
 
     # Calculate gain map
-    gain_map_data = calculate_gain_map(hdr_linear_data, sdr_srgb_data)
+    gain_map_data, gain_map_params = calculate_gain_map(hdr_linear_data, sdr_srgb_data)
 
     # Convert to 8-bit for JPEG encoding
     sdr_8bit = (sdr_srgb_data * 255).astype(np.uint8)
@@ -742,7 +808,7 @@ def cli(input_file, output, verify):
     try:
         # Create UltraHDR JPEG using native Python implementation
         ultra_hdr_data = create_ultra_hdr_jpeg(
-            sdr_bytes, gain_map_bytes, width, height, original_exif
+            sdr_bytes, gain_map_bytes, width, height, gain_map_params, original_exif
         )
 
         # Write the result
