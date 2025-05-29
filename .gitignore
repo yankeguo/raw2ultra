@@ -174,11 +174,13 @@ cython_debug/
 .pypirc
 
 # Image Files
-*.arw
-*.jpg
-*.jpeg
-*.png
-*.tiff
-*.webp
-*.heic
-*.heif
+/*.arw
+/*.bin
+/*.heic
+/*.heif
+/*.jpeg
+/*.jpg
+/*.png
+/*.raw
+/*.tiff
+/*.webp
